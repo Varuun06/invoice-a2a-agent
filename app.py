@@ -241,12 +241,18 @@ def klock(d, k):
     return d.setdefault(k, asyncio.Lock())
 
 
+def _origin():
+    u = urlparse(BASE_URL)
+    return f"{u.scheme}://{u.netloc}"
+
+
 def agent_card():
     return {
         "name": "Invoice Action Agent",
         "description": "Reads invoice packages, proposes one evidence-cited business action each, and executes only grader-accepted proposals.",
         "version": "1.0.0",
-        "supportedInterfaces": [{"url": BASE_URL, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
+        "supportedInterfaces": [{"url": u, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
+                                for u in dict.fromkeys([BASE_URL, _origin() + "/", _origin() + "/a2a/"])],
         "capabilities": {"streaming": False, "pushNotifications": False},
         "defaultInputModes": [MT_BATCH, MT_RESULTS],
         "defaultOutputModes": [MT_PROPOSALS, MT_RECEIPTS],
