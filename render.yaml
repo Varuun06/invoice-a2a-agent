@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: invoice-a2a-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /.well-known/agent-card.json
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: LLM_API_KEY
+        sync: false   # you paste this in the Render dashboard; never commit it
+      - key: LLM_MODEL
+        value: gemini-3.5-flash
+      - key: LLM_FALLBACK_MODEL
+        value: gemini-flash-lite-latest
