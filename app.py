@@ -16,12 +16,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import Response
 
 BASE_URL = os.environ.get("PUBLIC_BASE_URL") or (
-    os.environ["RENDER_EXTERNAL_URL"].rstrip("/") + "/a2a/" if os.environ.get("RENDER_EXTERNAL_URL")
-    else "http://localhost:8000/a2a/")
+    os.environ["RENDER_EXTERNAL_URL"].rstrip("/") + "/" if os.environ.get("RENDER_EXTERNAL_URL")
+    else "http://localhost:8000/")
 DB_PATH = os.environ.get("DB_PATH", "agent.db")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
@@ -37,6 +37,7 @@ JSON_CT = "application/a2a+json"
 
 PREFIX = urlparse(BASE_URL).path.rstrip("/")
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+router = APIRouter()
 
 # ---------------------------------------------------------------- storage
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
@@ -266,7 +267,7 @@ def terminal(task):
     return task["status"]["state"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED")
 
 
-@app.post(PREFIX + "/message:send")
+@router.post("/message:send")
 async def message_send(request: Request):
     p, e = check_common(request)
     if e:
@@ -362,7 +363,7 @@ async def continuation(p, msg, part, data, mid, mhash):
         return reply({"task": task})
 
 
-@app.get(PREFIX + "/tasks/{task_id}")
+@router.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
     p, e = check_common(request)
     if e:
@@ -371,7 +372,7 @@ async def get_task(task_id: str, request: Request):
     return reply(t) if t else err(404, "NOT_FOUND", "Task not found.")
 
 
-@app.get(PREFIX + "/tasks")
+@router.get("/tasks")
 async def list_tasks(request: Request):
     p, e = check_common(request)
     if e:
@@ -380,7 +381,7 @@ async def list_tasks(request: Request):
     return reply({"tasks": [json.loads(r[0]) for r in rows]})
 
 
-@app.post(PREFIX + "/tasks/{task_id}:cancel")
+@router.post("/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request):
     p, e = check_common(request)
     if e:
@@ -394,3 +395,7 @@ async def cancel_task(task_id: str, request: Request):
         t["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
         save_task(p, t)
         return reply(t)
+
+
+for _p in {PREFIX, "/a2a", ""}:
+    app.include_router(router, prefix=_p)
