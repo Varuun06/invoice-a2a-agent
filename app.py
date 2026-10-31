@@ -199,10 +199,13 @@ def render(pkg, paras):
 async def call_llm(policy, rendered, budget=40.0):
     user = f"policyRevision: {policy}\n\n" + "\n\n".join(rendered)
     t0, last = time.monotonic(), None
-    for model, cap in ((LLM_MODEL, 36.0), (LLM_FALLBACK, 20.0)):
-        timeout = min(cap, budget - (time.monotonic() - t0))
+    models = [LLM_MODEL, LLM_FALLBACK, "gemini-3.1-flash-lite", LLM_MODEL, LLM_FALLBACK]
+    for n, model in enumerate(models):
+        timeout = min(24.0, budget - (time.monotonic() - t0))
         if timeout < 4:
             break
+        if n:
+            await asyncio.sleep(min(1.0, max(0.0, timeout - 4)))
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 r = await c.post(
