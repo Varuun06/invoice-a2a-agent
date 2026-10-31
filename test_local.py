@@ -10,12 +10,15 @@ from fastapi.testclient import TestClient
 calls = []
 
 
-async def fake_llm(policy, pkgs):
-    calls.append(len(pkgs))
-    return {p["packageId"]: {
-        "action": "hold_invoice",
-        "facts": {"vendorName": "Acme", "invoiceNumber": "INV-1", "amountMinor": 1234, "currency": "inr"},
-        "evidenceRefs": p["refs"][:3], "rationale": "short"} for p in pkgs}
+async def fake_llm(policy, rendered, budget=40.0):
+    calls.append(len(rendered))
+    out = {}
+    for block in rendered:
+        pid = block.split("===")[1].replace("PACKAGE", "").strip()
+        out[pid] = {"action": "hold_invoice", "decidingParagraph": "P1",
+                    "facts": {"vendorName": "Acme", "invoiceNumber": "INV-1", "amountMinor": 1234, "currency": "inr"},
+                    "evidenceRefs": [], "rationale": "short"}
+    return out
 
 
 A.call_llm = fake_llm
@@ -35,6 +38,7 @@ def batch(mid, bid):
 assert c.get("/.well-known/agent-card.json").status_code == 200
 assert c.get("/a2a/tasks", headers={"A2A-Version": "1.0"}).status_code == 401
 assert c.get("/a2a/tasks", headers={**H, "A2A-Version": "0.3"}).status_code == 400
+assert c.post("/a2a/message:send", json=batch("mx", "bx"), headers={**H, "Content-Type": "application/json"}).status_code == 415
 
 r = c.post("/a2a/message:send", json=batch("m1", "b1"), headers=H)
 assert r.status_code == 200, r.text

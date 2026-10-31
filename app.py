@@ -124,38 +124,85 @@ def check_common(request: Request):
 
 
 # ---------------------------------------------------------------- decider
-SYSTEM = f"""You are an accounts-payable controller reviewing synthetic invoice packages.
-Choose exactly ONE action per package:
-- settle_invoice: invoice valid, reconciled (PO/receipt/amounts match) and within autonomous approval authority.
-- request_approval: commercially valid but the amount/terms exceed delegated authority; needs a human approver.
-- hold_invoice: payment pauses until a stated verification completes (e.g. bank-detail change callback, missing receipt/GRN, tax check).
-- reject_duplicate: this exact commercial invoice (same vendor + invoice number + amount) was ALREADY PAID. A payment for a different invoice number is NOT a duplicate.
-- open_exception: material records conflict (amount/vendor/PO/currency mismatches) and need an exception workflow.
-The documents mix useful facts with old examples, archive notes, training decoys, negation ("do not hold ...") and
-irrelevant action words. Decide from the paragraph that actually governs THIS invoice under the stated policy revision;
-ignore cover-sheet references, archive examples and training decoys. Negated or hypothetical statements do not count.
-evidenceRefs: return EXACTLY the three decisive bracketed references (copy character-for-character, including brackets
-if the document writes them with brackets) from that single deciding paragraph. Never use the cover-sheet reference.
-Respond with JSON only: {{"decisions":[{{"packageId":"...","action":"one of {ACTIONS}",
-"facts":{{"vendorName":"...","invoiceNumber":"...","amountMinor":<integer minor units, e.g. paise/cents>,"currency":"ISO code"}},
-"evidenceRefs":["r1","r2","r3"],"rationale":"2-4 sentences naming the action and citing the evidence refs"}}]}}"""
+PROMPT_VERSION = "v2"
+BR = re.compile(r"\[[^\[\]\r\n]{1,120}\]")
+
+SYSTEM = f"""You are a careful accounts-payable controller reviewing synthetic invoice packages.
+Each package is split into numbered paragraphs [P1], [P2], ... Choose exactly ONE action per package:
+- settle_invoice: the controlling facts say the invoice is valid, fully reconciled, and within autonomous approval authority, with NO pending verification, conflict, duplicate or approval requirement.
+- request_approval: commercially valid and reconciled, but amount/terms are OUTSIDE delegated authority, so a human approver must sign off before payment.
+- hold_invoice: payment pauses until a stated verification completes (e.g. bank-detail callback, missing receipt/GRN, tax/KYC check, vendor confirmation).
+- reject_duplicate: the SAME commercial invoice (same vendor, invoice number and amount) was ALREADY PAID. A payment for a different invoice number is NOT a duplicate.
+- open_exception: material records conflict (amount, vendor, PO, currency, quantity mismatches) and need an exception workflow.
+
+How to read a package:
+- The packages deliberately mix the controlling case facts with distractors: cover sheets, archive/old examples, training decoys, quoted past cases, hypotheticals, negated statements ("do NOT hold", "no duplicate was found") and irrelevant action words. Words like "hold" or "approval" in a distractor or in a negation do not decide anything.
+- The controlling paragraph is the one that states the CURRENT case's facts for this invoice under the stated policy revision and says what must happen. Pick that single paragraph.
+- Facts (vendorName, invoiceNumber, amount, currency) must be the controlling invoice's own, not an archive example's. amountMinor is an integer in minor units (INR 1,234.50 -> 123450; no decimals -> multiply by 100).
+- If the evidence is mixed or unclear, never choose settle_invoice: settle only when the controlling paragraph clearly supports payment.
+- Output "decidingParagraph" as the paragraph id (e.g. "P4") and "evidenceRefs" as the bracketed references from that paragraph (copy exactly, brackets included). Never use the cover-sheet reference.
+- rationale: 2-4 sentences. Name the action, state the decisive facts, explain how the evidence supports this action rather than the others, and quote at least two evidence refs verbatim.
+Respond with JSON only: {{"decisions":[{{"packageId":"...","action":"one of {ACTIONS}","decidingParagraph":"P#",
+"facts":{{"vendorName":"...","invoiceNumber":"...","amountMinor":<integer>,"currency":"ISO code"}},
+"evidenceRefs":["..."],"rationale":"..."}}]}}"""
 
 
-def cache_key(pkg):
+def cache_key(pkg, policy):
     pid = pkg.get("packageId")
     stripped = {k: v for k, v in pkg.items() if not (v == pid and isinstance(v, str))}
-    return sha(stripped)
+    return f"{PROMPT_VERSION}|{policy}|{sha(stripped)}"
 
 
-def package_text(pkg):
-    return canon(pkg)
+def paragraphs(pkg):
+    """Flatten a package into [(id, text)] paragraphs (split on blank lines, else on newlines)."""
+    out = []
+
+    def add(s):
+        s = s.strip()
+        if not s:
+            return
+        parts = re.split(r"\n\s*\n", s)
+        if len(parts) == 1 and "\n" in s:
+            parts = s.split("\n")
+        out.extend(p.strip() for p in parts if p.strip())
+
+    def walk(o):
+        if isinstance(o, str):
+            add(o)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                if k == "packageId":
+                    continue
+                if isinstance(v, (dict, list)):
+                    walk(v)
+                elif isinstance(v, str) and len(v) >= 80:
+                    add(v)
+                else:
+                    add(f"{k}: {v}")
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        elif o is not None:
+            add(str(o))
+
+    walk(pkg)
+    return [(f"P{i + 1}", t) for i, t in enumerate(out)]
 
 
-async def call_llm(policy, pkgs):
-    user = f"policyRevision: {policy}\npackages:\n" + json.dumps(pkgs, ensure_ascii=False)
-    last = None
-    # primary model gets most of the 45s request budget; the fast fallback covers a slow/failed first try
-    for model, timeout in ((LLM_MODEL, 28), (LLM_FALLBACK, 14)):
+def render(pkg, paras):
+    lines = [f"=== PACKAGE {pkg['packageId']} ==="]
+    for pid, t in paras:
+        lines.append(f"[{pid}] {t}")
+    return "\n".join(lines)
+
+
+async def call_llm(policy, rendered, budget=40.0):
+    user = f"policyRevision: {policy}\n\n" + "\n\n".join(rendered)
+    t0, last = time.monotonic(), None
+    for model, cap in ((LLM_MODEL, 36.0), (LLM_FALLBACK, 20.0)):
+        timeout = min(cap, budget - (time.monotonic() - t0))
+        if timeout < 4:
+            break
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 r = await c.post(
@@ -171,12 +218,13 @@ async def call_llm(policy, pkgs):
             return {d["packageId"]: d for d in json.loads(txt)["decisions"]}
         except Exception as e:
             last = repr(e)
+            print("LLM_ERROR", model, last[:300], flush=True)
     raise RuntimeError(f"llm failed: {last}")
 
 
-def clean_decision(pkg, d):
+def clean_decision(pkg, paras, d):
     """Validate/normalize a model decision. Returns dict or None if unusable."""
-    text = package_text(pkg)
+    text = canon(pkg)
     action = d.get("action")
     if action not in ACTIONS:
         return None
@@ -187,10 +235,11 @@ def clean_decision(pkg, d):
     except Exception:
         return None
     refs = []
-    for r in d.get("evidenceRefs") or []:
-        r = str(r)
-        if r in text and r not in refs:
-            refs.append(r)
+    para = dict(paras).get(str(d.get("decidingParagraph", "")).strip("[] "))
+    if para:
+        refs = list(dict.fromkeys(BR.findall(para)))
+    if len(refs) != 3:  # fall back to what the model listed, if it really appears in the package
+        refs = [r for r in dict.fromkeys(str(x) for x in (d.get("evidenceRefs") or [])) if r in text]
     if len(refs) < 2:
         return None
     rationale = str(d.get("rationale", "")).strip()
@@ -206,27 +255,33 @@ def clean_decision(pkg, d):
 
 async def decide(policy, pkgs):
     """pkg list -> {packageId: decision}, using the content-keyed cache and one batched model call."""
+    t0 = time.monotonic()
     out, missing = {}, []
     for p in pkgs:
-        row = db_one("SELECT body FROM decisions WHERE key=?", (cache_key(p) + "|" + str(policy),))
+        row = db_one("SELECT body FROM decisions WHERE key=?", (cache_key(p, policy),))
         if row:
             out[p["packageId"]] = json.loads(row[0])
         else:
             missing.append(p)
-    for attempt in range(1):
+    for attempt in range(2):
         if not missing:
             break
-        got = await call_llm(policy, missing)
+        budget = 42.0 - (time.monotonic() - t0)
+        if budget < 6:
+            break
+        paras = {p["packageId"]: paragraphs(p) for p in missing}
+        if attempt == 0:
+            print("PKGSAMPLE", json.dumps(missing[0], ensure_ascii=False)[:2500], flush=True)
+        got = await call_llm(policy, [render(p, paras[p["packageId"]]) for p in missing], budget)
         still = []
         for p in missing:
-            d = clean_decision(p, got.get(p["packageId"], {}))
+            d = clean_decision(p, paras[p["packageId"]], got.get(p["packageId"], {}))
             if d is None:
                 still.append(p)
                 continue
             out[p["packageId"]] = d
             with _db_lock:
-                _db.execute("INSERT OR REPLACE INTO decisions VALUES(?,?)",
-                            (cache_key(p) + "|" + str(policy), json.dumps(d)))
+                _db.execute("INSERT OR REPLACE INTO decisions VALUES(?,?)", (cache_key(p, policy), json.dumps(d)))
         missing = still
     if missing:
         raise RuntimeError("could not decide all packages")
@@ -278,7 +333,7 @@ async def message_send(request: Request):
     p, e = check_common(request)
     if e:
         return e
-    if "json" not in request.headers.get("content-type", "").lower():
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != JSON_CT:
         return err(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/a2a+json.")
     try:
         body = await request.json()
@@ -383,8 +438,12 @@ async def list_tasks(request: Request):
     p, e = check_common(request)
     if e:
         return e
-    rows = db_all("SELECT body FROM tasks WHERE principal=? ORDER BY seq", (p,))
-    return reply({"tasks": [json.loads(r[0]) for r in rows]})
+    rows = db_all("SELECT body FROM tasks WHERE principal=? ORDER BY seq DESC LIMIT 50", (p,))
+    tasks = []
+    for r in rows:  # compact view: full history/artifacts are available via GET /tasks/{id}
+        t = json.loads(r[0])
+        tasks.append({"id": t["id"], "contextId": t["contextId"], "status": t["status"]})
+    return reply({"tasks": tasks})
 
 
 @router.post("/tasks/{task_id}:cancel")
